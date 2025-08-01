@@ -584,20 +584,28 @@ def main():
             # 비디오 처리 및 데이터 추출
             result_data = extractor.process_video(video_path, output_path)
             
-            # 메타데이터 추가
-            result_data['metadata'] = {
-                '번호': int(row_data['번호']),
-                '언어_제공자_ID': int(row_data['언어 제공자 ID']),
-                '취득연도': int(row_data['취득연도']),
-                '방향': row_data['방향'],
-                '타입': row_data['타입(단어/문장)'],
-                '파일명': row_data['파일명'],
-                '한국어': row_data['한국어']
+            # 메타데이터를 최상단에 영어로 추가
+            metadata = {
+                'id': int(row_data['번호']),
+                'provider_id': int(row_data['언어 제공자 ID']),
+                'acquisition_year': int(row_data['취득연도']),
+                'direction': row_data['방향'],
+                'type': row_data['타입(단어/문장)'],
+                'filename': row_data['파일명'],
+                'korean_text': row_data['한국어']
+            }
+            
+            # 메타데이터를 최상단에 배치
+            result_data_with_metadata = {
+                'metadata': metadata,
+                'video_info': result_data['video_info'],
+                'frame_data': result_data['frame_data'],
+                'statistics': result_data['statistics']
             }
             
             # 메타데이터가 포함된 결과를 다시 저장
             with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(result_data, f, ensure_ascii=False, indent=2)
+                json.dump(result_data_with_metadata, f, ensure_ascii=False, indent=2)
             
             # 통계 정보 출력
             stats = result_data['statistics']
