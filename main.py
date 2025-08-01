@@ -550,6 +550,12 @@ def main():
         base_name = os.path.splitext(filename)[0]
         
         if base_name in video_files:
+            # 이미 JSON 파일이 존재하는지 확인
+            output_path = os.path.join(output_dir, f"{base_name}_skeleton_data.json")
+            if os.path.exists(output_path):
+                logging.info(f"이미 처리된 파일 건너뛰기: {filename}")
+                continue
+                
             processable_files.append({
                 'row_data': row,
                 'video_path': video_files[base_name],
