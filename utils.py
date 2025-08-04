@@ -6,9 +6,12 @@ from typing import List, Dict, Any
 
 def setup_logging():
     """로깅 설정"""
+    # 로그 디렉토리 생성
+    log_dir = os.path.join('.', 'logs', 'extractor')
+    os.makedirs(log_dir, exist_ok=True)
     # 로그 파일명 생성 (현재 시간 기준)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filename = f"sign_language_processing_{timestamp}.log"
+    log_filename = os.path.join(log_dir, f"sign_language_processing_{timestamp}.log")
     
     # 로깅 설정
     logging.basicConfig(
