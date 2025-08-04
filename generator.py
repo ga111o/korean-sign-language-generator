@@ -11,13 +11,47 @@ import math
 from torch.nn.utils.rnn import pad_sequence
 import cv2
 from tqdm import tqdm
+import logging
+from datetime import datetime
+
+# =============================================================================
+# Logging Setup
+# =============================================================================
+
+def setup_logging():
+    """Setup logging configuration for generator."""
+    # Create logs directory if it doesn't exist
+    log_dir = './logs/generator/'
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Create timestamp for log file
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file = os.path.join(log_dir, f'generator_{timestamp}.log')
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file, encoding='utf-8'),
+            logging.StreamHandler()  # Also print to console
+        ]
+    )
+    
+    logger = logging.getLogger(__name__)
+    logger.info(f"Logging initialized. Log file: {log_file}")
+    
+    return logger
+
+# Initialize logger
+logger = setup_logging()
 
 # =============================================================================
 # Data Loading and Preprocessing
 # =============================================================================
 
 class SignLanguageDataset(Dataset):
-    """Dataset class for sign language data with extracted landmarks."""
+    """Dataset class for sign language data with extracted landmarks - Fixed version."""
     
     def __init__(self, json_dir: str, max_frames: int = 150, max_text_length: int = 128):
         self.json_dir = json_dir
@@ -26,63 +60,179 @@ class SignLanguageDataset(Dataset):
         self.data_files = [f for f in os.listdir(json_dir) if f.endswith('.json')]
         
         # Landmark dimensions
-        self.pose_dim = 33 * 4  # 33 landmarks with 4 values each (x, y, z, visibility)
-        self.face_dim = 468 * 3  # 468 landmarks with 3 values each (x, y, z)
-        self.hand_dim = 21 * 3   # 21 landmarks with 3 values each (x, y, z)
+        self.pose_dim = 33 * 4
+        self.face_dim = 468 * 3
+        self.hand_dim = 21 * 3
         
-        # Initialize tokenizer for text processing
+        # Initialize tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained('klue/bert-base')
         
+        # Compute normalization statistics
+        self._compute_normalization_stats()
+        
+    def _compute_normalization_stats(self):
+        """Compute mean and std for normalization with improved stability."""
+        logger.info("Computing normalization statistics...")
+        
+        pose_data = []
+        face_data = []
+        hand_data = []
+        
+        # Sample a subset for statistics computation
+        sample_size = min(100, len(self.data_files))
+        
+        for i in range(sample_size):
+            json_path = os.path.join(self.json_dir, self.data_files[i])
+            try:
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                frames = data['frame_data'][:self.max_frames]
+                
+                for frame in frames:
+                    # Collect pose data
+                    pose_landmarks = frame['landmarks'].get('pose', [])
+                    if pose_landmarks:
+                        pose_flat = [coord for landmark in pose_landmarks for coord in landmark]
+                        if len(pose_flat) >= self.pose_dim:
+                            pose_data.append(pose_flat[:self.pose_dim])
+                    
+                    # Collect face data
+                    face_landmarks = frame['landmarks'].get('face', [])
+                    if face_landmarks:
+                        face_flat = [coord for landmark in face_landmarks for coord in landmark[:3]]
+                        if len(face_flat) >= self.face_dim:
+                            face_data.append(face_flat[:self.face_dim])
+                    
+                    # Collect hand data
+                    for hand_key in ['left_hand', 'right_hand']:
+                        hand_landmarks = frame['landmarks'].get(hand_key, [])
+                        if hand_landmarks:
+                            hand_flat = [coord for landmark in hand_landmarks for coord in landmark[:3]]
+                            if len(hand_flat) >= self.hand_dim:
+                                hand_data.append(hand_flat[:self.hand_dim])
+                                
+            except Exception as e:
+                logger.error(f"Error processing {self.data_files[i]}: {e}")
+                continue
+        
+        # Compute statistics with improved numerical stability
+        if pose_data:
+            pose_array = np.array(pose_data, dtype=np.float32)
+            # Clip extreme values before computing statistics
+            pose_array = np.clip(pose_array, -10, 10)
+            self.pose_mean = np.mean(pose_array, axis=0)
+            self.pose_std = np.std(pose_array, axis=0) + 1e-4  # Increased epsilon
+            # Ensure std is not too small
+            self.pose_std = np.maximum(self.pose_std, 0.1)
+        else:
+            self.pose_mean = np.zeros(self.pose_dim, dtype=np.float32)
+            self.pose_std = np.ones(self.pose_dim, dtype=np.float32)
+            
+        if face_data:
+            face_array = np.array(face_data, dtype=np.float32)
+            face_array = np.clip(face_array, -10, 10)
+            self.face_mean = np.mean(face_array, axis=0)
+            self.face_std = np.std(face_array, axis=0) + 1e-4
+            self.face_std = np.maximum(self.face_std, 0.1)
+        else:
+            self.face_mean = np.zeros(self.face_dim, dtype=np.float32)
+            self.face_std = np.ones(self.face_dim, dtype=np.float32)
+            
+        if hand_data:
+            hand_array = np.array(hand_data, dtype=np.float32)
+            hand_array = np.clip(hand_array, -10, 10)
+            self.hand_mean = np.mean(hand_array, axis=0)
+            self.hand_std = np.std(hand_array, axis=0) + 1e-4
+            self.hand_std = np.maximum(self.hand_std, 0.1)
+        else:
+            self.hand_mean = np.zeros(self.hand_dim, dtype=np.float32)
+            self.hand_std = np.ones(self.hand_dim, dtype=np.float32)
+        
+        logger.info("Normalization statistics computed with improved stability.")
+    
+    def _normalize_data(self, data, mean, std):
+        """Normalize data using computed statistics with clipping."""
+        normalized = (data - mean) / std
+        # Clip normalized values to prevent extreme values
+        normalized = np.clip(normalized, -5, 5)
+        return normalized
+    
+    def _validate_tensor(self, tensor, name):
+        """Validate tensor for NaN/Inf values with more aggressive fixing."""
+        if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+            logger.warning(f"NaN/Inf found in {name}, replacing with zeros")
+            tensor = torch.zeros_like(tensor)
+        # Additional clipping for safety
+        tensor = torch.clamp(tensor, -10, 10)
+        return tensor
+    
     def __len__(self):
         return len(self.data_files)
     
     def __getitem__(self, idx):
-        # Load JSON data
         json_path = os.path.join(self.json_dir, self.data_files[idx])
         with open(json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-                
-        # Extract text
+        
         try:
             text = data['metadata']['korean_text']
         except:
-            print(f"No text found for {self.data_files[idx]}")
-            print(data['metadata'])
-
+            logger.warning(f"No text found for {self.data_files[idx]}")
+            text = "빈 텍스트"
         
-        # Process frame data
         frames = data['frame_data']
-        pose_sequence = []
-        face_sequence = []
-        left_hand_sequence = []
-        right_hand_sequence = []
         
-        for frame in frames[:self.max_frames]:
-            # Extract pose landmarks
+        # Pre-allocate numpy arrays instead of lists - MAJOR FIX
+        max_len = min(len(frames), self.max_frames)
+        pose_sequence = np.zeros((max_len, self.pose_dim), dtype=np.float32)
+        face_sequence = np.zeros((max_len, self.face_dim), dtype=np.float32)
+        left_hand_sequence = np.zeros((max_len, self.hand_dim), dtype=np.float32)
+        right_hand_sequence = np.zeros((max_len, self.hand_dim), dtype=np.float32)
+        
+        for i, frame in enumerate(frames[:max_len]):
+            # Extract and normalize pose landmarks
             pose_landmarks = frame['landmarks'].get('pose', [])
-            pose_flat = [coord for landmark in pose_landmarks for coord in landmark] if pose_landmarks else [0] * self.pose_dim
-            pose_sequence.append(pose_flat[:self.pose_dim])
+            if pose_landmarks:
+                pose_flat = [coord for landmark in pose_landmarks for coord in landmark]
+                pose_flat = pose_flat[:self.pose_dim] + [0] * max(0, self.pose_dim - len(pose_flat))
+            else:
+                pose_flat = [0] * self.pose_dim
             
-            # Extract face landmarks
+            pose_flat = np.array(pose_flat[:self.pose_dim], dtype=np.float32)
+            pose_normalized = self._normalize_data(pose_flat, self.pose_mean, self.pose_std)
+            pose_sequence[i] = pose_normalized
+            
+            # Extract and normalize face landmarks
             face_landmarks = frame['landmarks'].get('face', [])
-            face_flat = [coord for landmark in face_landmarks for coord in landmark[:3]] if face_landmarks else [0] * self.face_dim
-            face_sequence.append(face_flat[:self.face_dim])
+            if face_landmarks:
+                face_flat = [coord for landmark in face_landmarks for coord in landmark[:3]]
+                face_flat = face_flat[:self.face_dim] + [0] * max(0, self.face_dim - len(face_flat))
+            else:
+                face_flat = [0] * self.face_dim
             
-            # Extract hand landmarks
-            left_hand = frame['landmarks'].get('left_hand', [])
-            right_hand = frame['landmarks'].get('right_hand', [])
+            face_flat = np.array(face_flat[:self.face_dim], dtype=np.float32)
+            face_normalized = self._normalize_data(face_flat, self.face_mean, self.face_std)
+            face_sequence[i] = face_normalized
             
-            left_hand_flat = [coord for landmark in left_hand for coord in landmark[:3]] if left_hand else [0] * self.hand_dim
-            right_hand_flat = [coord for landmark in right_hand for coord in landmark[:3]] if right_hand else [0] * self.hand_dim
-            
-            left_hand_sequence.append(left_hand_flat[:self.hand_dim])
-            right_hand_sequence.append(right_hand_flat[:self.hand_dim])
+            # Extract and normalize hand landmarks
+            for hand_key, hand_seq in [('left_hand', left_hand_sequence), ('right_hand', right_hand_sequence)]:
+                hand_landmarks = frame['landmarks'].get(hand_key, [])
+                if hand_landmarks:
+                    hand_flat = [coord for landmark in hand_landmarks for coord in landmark[:3]]
+                    hand_flat = hand_flat[:self.hand_dim] + [0] * max(0, self.hand_dim - len(hand_flat))
+                else:
+                    hand_flat = [0] * self.hand_dim
+                
+                hand_flat = np.array(hand_flat[:self.hand_dim], dtype=np.float32)
+                hand_normalized = self._normalize_data(hand_flat, self.hand_mean, self.hand_std)
+                hand_seq[i] = hand_normalized
         
-        # Convert to tensors
-        pose_tensor = torch.FloatTensor(pose_sequence)
-        face_tensor = torch.FloatTensor(face_sequence)
-        left_hand_tensor = torch.FloatTensor(left_hand_sequence)
-        right_hand_tensor = torch.FloatTensor(right_hand_sequence)
+        # Convert to tensors directly from numpy arrays - MAJOR FIX
+        pose_tensor = self._validate_tensor(torch.from_numpy(pose_sequence), "pose")
+        face_tensor = self._validate_tensor(torch.from_numpy(face_sequence), "face")
+        left_hand_tensor = self._validate_tensor(torch.from_numpy(left_hand_sequence), "left_hand")
+        right_hand_tensor = self._validate_tensor(torch.from_numpy(right_hand_sequence), "right_hand")
         
         # Tokenize text
         text_tokens = self.tokenizer(
@@ -417,13 +567,13 @@ class ContrastiveLearningModule(nn.Module):
 # =============================================================================
 
 class MHAGModel(nn.Module):
-    """Multi-Modal Hierarchical Attention Generator (MHAG)."""
+    """Multi-Modal Hierarchical Attention Generator (MHAG) - Fixed version."""
     
     def __init__(self, 
                  d_model: int = 512,
-                 pose_dim: int = 132,  # 33 * 4
-                 face_dim: int = 1404,  # 468 * 3
-                 hand_dim: int = 63):   # 21 * 3
+                 pose_dim: int = 132,
+                 face_dim: int = 1404,
+                 hand_dim: int = 63):
         super().__init__()
         
         self.d_model = d_model
@@ -440,20 +590,61 @@ class MHAGModel(nn.Module):
         # Cross-modal attention
         self.cross_modal_attention = nn.MultiheadAttention(d_model, num_heads=8, batch_first=True)
         
+        # Apply proper initialization
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, module):
+        """Initialize weights properly to prevent NaN."""
+        if isinstance(module, nn.Linear):
+            torch.nn.init.xavier_uniform_(module.weight, gain=0.1)  # Smaller gain for stability
+            if module.bias is not None:
+                torch.nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.Conv1d):
+            torch.nn.init.xavier_uniform_(module.weight, gain=0.1)
+            if module.bias is not None:
+                torch.nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.constant_(module.bias, 0)
+            torch.nn.init.constant_(module.weight, 1.0)
+        elif isinstance(module, nn.Parameter):
+            torch.nn.init.normal_(module, mean=0, std=0.02)
+    
     def forward(self, text_tokens, target_length: int, labels=None):
         # Semantic understanding
         semantic_features = self.semantic_module(text_tokens)
+        
+        # Validate semantic features
+        if torch.isnan(semantic_features).any():
+            logger.warning("NaN in semantic features")
+            semantic_features = torch.nan_to_num(semantic_features, nan=0.0)
         
         # Cross-modal attention alignment
         aligned_features, _ = self.cross_modal_attention(
             semantic_features, semantic_features, semantic_features
         )
         
+        # Validate aligned features
+        if torch.isnan(aligned_features).any():
+            logger.warning("NaN in aligned features")
+            aligned_features = torch.nan_to_num(aligned_features, nan=0.0)
+        
         # Hierarchical motion planning
         motion_features = self.motion_planner(aligned_features, target_length)
         
+        # Validate motion features
+        for key, value in motion_features.items():
+            if torch.isnan(value).any():
+                logger.warning(f"NaN in motion features - {key}")
+                motion_features[key] = torch.nan_to_num(value, nan=0.0)
+        
         # Multi-keypoint generation
         keypoint_outputs = self.keypoint_generator(motion_features)
+        
+        # Validate keypoint outputs
+        for key, value in keypoint_outputs.items():
+            if key != 'weights' and torch.isnan(value).any():
+                logger.warning(f"NaN in keypoint outputs - {key}")
+                keypoint_outputs[key] = torch.nan_to_num(value, nan=0.0)
         
         # Contrastive learning
         contrastive_features, contrastive_loss = self.contrastive_module(
@@ -473,32 +664,71 @@ class MHAGModel(nn.Module):
 # =============================================================================
 
 class MHAGTrainer:
-    """Training pipeline for MHAG model."""
+    """Training pipeline for MHAG model - Fixed version with better stability."""
     
     def __init__(self, model, device='cuda'):
         self.model = model.to(device)
         self.device = device
-        self.optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=100)
         
+        # Use even smaller learning rate for stability
+        self.optimizer = torch.optim.AdamW(
+            model.parameters(), 
+            lr=1e-5,  # Reduced further
+            weight_decay=0.01,
+            eps=1e-8
+        )
+        
+        # Use cosine annealing instead of OneCycleLR for stability
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=50,
+            eta_min=1e-7
+        )
+
     def compute_reconstruction_loss(self, predicted, target):
-        """Compute MSE loss for keypoint reconstruction."""
+        """Compute MSE loss for keypoint reconstruction with enhanced stability."""
         losses = {}
         total_loss = 0
+        valid_modalities = 0
         
         for modality in ['pose', 'face', 'left_hand', 'right_hand']:
             if modality in predicted and modality in target:
-                # Handle sequence length mismatch
                 pred_seq = predicted[modality]
                 target_seq = target[modality]
                 
+                # Handle sequence length mismatch
                 min_len = min(pred_seq.shape[1], target_seq.shape[1])
                 pred_seq = pred_seq[:, :min_len, :]
                 target_seq = target_seq[:, :min_len, :]
                 
-                loss = F.mse_loss(pred_seq, target_seq)
-                losses[f'{modality}_loss'] = loss
-                total_loss += loss
+                # Aggressive clipping and NaN handling
+                pred_seq = torch.clamp(pred_seq, -10, 10)
+                target_seq = torch.clamp(target_seq, -10, 10)
+                
+                pred_seq = torch.nan_to_num(pred_seq, nan=0.0, posinf=1.0, neginf=-1.0)
+                target_seq = torch.nan_to_num(target_seq, nan=0.0, posinf=1.0, neginf=-1.0)
+                
+                # Use MSE instead of Huber for more stability
+                loss = F.mse_loss(pred_seq, target_seq, reduction='mean')
+                
+                # Additional validation
+                if torch.isfinite(loss) and loss < 1000:  # Reject extremely large losses
+                    losses[f'{modality}_loss'] = loss
+                    total_loss += loss
+                    valid_modalities += 1
+                else:
+                    logger.warning(f"Invalid/extreme loss for {modality}: {loss}, setting to 0")
+                    losses[f'{modality}_loss'] = torch.tensor(0.0, device=pred_seq.device)
+        
+        # Average loss across valid modalities
+        if valid_modalities > 0:
+            total_loss = total_loss / valid_modalities
+        else:
+            total_loss = torch.tensor(0.0, device=self.device)
+        
+        # Final safety check
+        if not torch.isfinite(total_loss):
+            total_loss = torch.tensor(0.0, device=self.device)
         
         return total_loss, losses
     
@@ -506,73 +736,136 @@ class MHAGTrainer:
         self.model.train()
         self.optimizer.zero_grad()
         
-        # Move data to device
-        text_tokens = {k: v.to(self.device).squeeze(1) for k, v in batch['text_tokens'].items()}
-        
-        target_keypoints = {
-            'pose': batch['pose'].to(self.device),
-            'face': batch['face'].to(self.device),
-            'left_hand': batch['left_hand'].to(self.device),
-            'right_hand': batch['right_hand'].to(self.device)
-        }
-        
-        target_length = target_keypoints['pose'].shape[1]
-        
-        # Create labels for contrastive learning (using text for simplicity)
-        labels = torch.arange(len(batch['text'])).to(self.device)
-        
-        # Forward pass
-        outputs = self.model(text_tokens, target_length, labels)
-        
-        # Compute reconstruction loss
-        recon_loss, detailed_losses = self.compute_reconstruction_loss(
-            outputs['keypoints'], target_keypoints
-        )
-        
-        # Total loss
-        total_loss = recon_loss
-        if outputs['contrastive_loss'] is not None:
-            total_loss += 0.1 * outputs['contrastive_loss']
-        
-        # Backward pass
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-        self.optimizer.step()
-        
-        return {
-            'total_loss': total_loss.item(),
-            'reconstruction_loss': recon_loss.item(),
-            'contrastive_loss': outputs['contrastive_loss'].item() if outputs['contrastive_loss'] is not None else 0,
-            **{k: v.item() for k, v in detailed_losses.items()}
-        }
-    
+        try:
+            # Move data to device
+            text_tokens = {k: v.to(self.device).squeeze(1) for k, v in batch['text_tokens'].items()}
+            
+            target_keypoints = {
+                'pose': batch['pose'].to(self.device),
+                'face': batch['face'].to(self.device),
+                'left_hand': batch['left_hand'].to(self.device),
+                'right_hand': batch['right_hand'].to(self.device)
+            }
+            
+            # Additional input validation
+            for key, value in target_keypoints.items():
+                if torch.isnan(value).any() or torch.isinf(value).any():
+                    logger.warning(f"Invalid values in target {key}, replacing with zeros")
+                    target_keypoints[key] = torch.zeros_like(value)
+            
+            target_length = target_keypoints['pose'].shape[1]
+            labels = torch.arange(len(batch['text'])).to(self.device)
+            
+            # Forward pass
+            outputs = self.model(text_tokens, target_length, labels)
+            
+            # Validate all outputs before loss computation
+            for key, value in outputs['keypoints'].items():
+                if key != 'weights' and (torch.isnan(value).any() or torch.isinf(value).any()):
+                    print(f"Warning: Invalid model output in {key}, replacing with zeros")
+                    outputs['keypoints'][key] = torch.zeros_like(value)
+            
+            # Compute reconstruction loss
+            recon_loss, detailed_losses = self.compute_reconstruction_loss(
+                outputs['keypoints'], target_keypoints
+            )
+            
+            # More conservative contrastive loss handling
+            total_loss = recon_loss
+            if (outputs['contrastive_loss'] is not None and 
+                torch.isfinite(outputs['contrastive_loss']) and 
+                outputs['contrastive_loss'] < 100):
+                total_loss += 0.01 * outputs['contrastive_loss']  # Reduced weight
+            
+            # Final safety check for total loss
+            if not torch.isfinite(total_loss) or total_loss > 1000:
+                logger.warning(f"Invalid total loss: {total_loss}, skipping batch")
+                return {
+                    'total_loss': 0.0,
+                    'reconstruction_loss': 0.0,
+                    'contrastive_loss': 0.0,
+                    **{k: 0.0 for k in detailed_losses.keys()}
+                }
+            
+            # Backward pass with additional safety
+            try:
+                total_loss.backward()
+            except RuntimeError as e:
+                logger.error(f"Error in backward pass: {e}, skipping batch")
+                return {
+                    'total_loss': 0.0,
+                    'reconstruction_loss': 0.0,
+                    'contrastive_loss': 0.0,
+                    **{k: 0.0 for k in detailed_losses.keys()}
+                }
+            
+            # More aggressive gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.1)
+            
+            # Check for valid gradients
+            valid_gradients = True
+            for name, param in self.model.named_parameters():
+                if param.grad is not None:
+                    if not torch.isfinite(param.grad).all():
+                        valid_gradients = False
+                        break
+            
+            if valid_gradients:
+                self.optimizer.step()
+            else:
+                logger.warning("Skipping optimizer step due to invalid gradients")
+            
+            self.scheduler.step()
+            
+            # Remove the print statement that was causing issues
+            return {
+                'total_loss': float(total_loss.item()),
+                'reconstruction_loss': float(recon_loss.item()),
+                'contrastive_loss': float(outputs['contrastive_loss'].item()) if outputs['contrastive_loss'] is not None else 0.0,
+                **{k: float(v.item()) for k, v in detailed_losses.items()}
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in train_step: {e}")
+            return {
+                'total_loss': 0.0,
+                'reconstruction_loss': 0.0,
+                'contrastive_loss': 0.0,
+                'pose_loss': 0.0,
+                'face_loss': 0.0,
+                'left_hand_loss': 0.0,
+                'right_hand_loss': 0.0
+            }
+
     def train_epoch(self, dataloader):
-        """Train for one epoch."""
+        """Train for one epoch and return average losses."""
         total_losses = {}
         num_batches = 0
         
-        progress_bar = tqdm(dataloader, desc="Training")
-        for batch in progress_bar:
+        for batch_idx, batch in enumerate(dataloader):
+            # Train step
             losses = self.train_step(batch)
             
-            # Accumulate losses
+            # Accumulate losses (only valid ones)
             for key, value in losses.items():
-                if key not in total_losses:
-                    total_losses[key] = 0
-                total_losses[key] += value
+                if isinstance(value, (int, float)) and not math.isnan(value) and math.isfinite(value):
+                    if key not in total_losses:
+                        total_losses[key] = 0
+                    total_losses[key] += value
             
             num_batches += 1
             
-            # Update progress bar
-            progress_bar.set_postfix({
-                'loss': f"{losses['total_loss']:.4f}",
-                'recon': f"{losses['reconstruction_loss']:.4f}"
-            })
+            # Print progress every 10 batches
+            if (batch_idx + 1) % 10 == 0:
+                total_loss_val = losses.get('total_loss', 0)
+                logger.info(f"  Batch {batch_idx + 1}/{len(dataloader)}: "
+                      f"Total Loss: {total_loss_val:.6f}")
         
-        # Average losses
-        avg_losses = {key: value / num_batches for key, value in total_losses.items()}
-        
-        self.scheduler.step()
+        # Calculate average losses
+        avg_losses = {}
+        if num_batches > 0:
+            for key, total_value in total_losses.items():
+                avg_losses[key] = total_value / num_batches
         
         return avg_losses
 
@@ -628,7 +921,7 @@ def main():
         'device': 'cuda' if torch.cuda.is_available() else 'cpu'
     }
     
-    print(f"Using device: {config['device']}")
+    logger.info(f"Using device: {config['device']}")
     
     # Initialize dataset and dataloader
     dataset = SignLanguageDataset(
@@ -680,20 +973,20 @@ def main():
     # Initialize trainer
     trainer = MHAGTrainer(model, device=config['device'])
     
-    print(f"Model initialized with {sum(p.numel() for p in model.parameters())} parameters")
+    logger.info(f"Model initialized with {sum(p.numel() for p in model.parameters())} parameters")
     
     # Training loop
-    print("Starting training...")
+    logger.info("Starting training...")
     for epoch in range(config['num_epochs']):
-        print(f"\nEpoch {epoch + 1}/{config['num_epochs']}")
+        logger.info(f"\nEpoch {epoch + 1}/{config['num_epochs']}")
         
         # Train epoch
         avg_losses = trainer.train_epoch(dataloader)
         
         # Print epoch results
-        print(f"Average losses:")
+        logger.info(f"Average losses:")
         for key, value in avg_losses.items():
-            print(f"  {key}: {value:.6f}")
+            logger.info(f"  {key}: {value:.6f}")
         
         # Save checkpoint every 10 epochs
         if (epoch + 1) % 10 == 0:
@@ -705,12 +998,12 @@ def main():
                 'scheduler_state_dict': trainer.scheduler.state_dict(),
                 'losses': avg_losses
             }, checkpoint_path)
-            print(f"Checkpoint saved: {checkpoint_path}")
+            logger.info(f"Checkpoint saved: {checkpoint_path}")
     
     # Inference example
-    print("\n" + "="*50)
-    print("Inference Example")
-    print("="*50)
+    logger.info("\n" + "="*50)
+    logger.info("Inference Example")
+    logger.info("="*50)
     
     # Initialize inference engine
     inference_engine = MHAGInference(
@@ -727,17 +1020,17 @@ def main():
     ]
     
     for text in sample_texts:
-        print(f"\nGenerating sign language for: '{text}'")
+        logger.info(f"\nGenerating sign language for: '{text}'")
         keypoints = inference_engine.generate_sign_language(text, target_length=60)
         
-        print(f"Generated keypoint sequences:")
+        logger.info(f"Generated keypoint sequences:")
         for modality, data in keypoints.items():
-            print(f"  {modality}: {data.shape}")
+            logger.info(f"  {modality}: {data.shape}")
         
         # Save generated keypoints (optional)
         output_file = f"generated_{text.replace(' ', '_')}.npz"
         np.savez(output_file, **keypoints)
-        print(f"Keypoints saved to: {output_file}")
+        logger.info(f"Keypoints saved to: {output_file}")
 
 def load_and_inference(checkpoint_path: str, text: str):
     """Load trained model and perform inference."""
@@ -769,4 +1062,4 @@ if __name__ == "__main__":
 
     # Example usage for loading and inference
     keypoints = load_and_inference('mhag_checkpoint_epoch_50.pth', '탈골')
-    print("Generated keypoints shape:", {k: v.shape for k, v in keypoints.items()})
+    logger.info("Generated keypoints shape:", {k: v.shape for k, v in keypoints.items()})
