@@ -40,9 +40,11 @@ SUPPORTED_VIDEO_EXTENSIONS = [
 # MediaPipe settings
 MEDIAPIPE_CONFIG = {
     'static_image_mode': False,
-    'model_complexity': 2,
-    'enable_segmentation': True,
-    'refine_face_landmarks': True
+    'model_complexity': 1,  # 복잡도를 1로 낮춰 안정성 향상
+    'enable_segmentation': False,  # 세그멘테이션 비활성화로 오류 방지
+    'refine_face_landmarks': True,
+    'min_detection_confidence': 0.5,
+    'min_tracking_confidence': 0.5
 }
 
 # Processing settings
@@ -52,6 +54,14 @@ PROCESSING_CONFIG = {
     'max_num_hands': 2,
     'max_num_faces': 1,
     'min_face_detection_confidence': 0.5
+}
+
+# Frame processing settings for stability
+FRAME_PROCESSING_CONFIG = {
+    'frame_size_tolerance': 0.05,  # 5% 크기 차이 허용
+    'max_consecutive_errors': 5,    # 연속 오류 허용 개수
+    'resize_interpolation': 'linear',  # 리사이징 보간 방법
+    'skip_corrupted_frames': True,     # 손상된 프레임 건너뛰기
 }
 
 # File naming patterns

@@ -8,18 +8,111 @@ from typing import List, Dict, Any, Tuple
 import math
 from datetime import datetime
 import logging
-from config import MEDIAPIPE_CONFIG
+from config import MEDIAPIPE_CONFIG, FRAME_PROCESSING_CONFIG
 
 class SignLanguageSkeletonExtractor:
     def __init__(self):
         # MediaPipe 초기화
         self.mp_holistic = mp.solutions.holistic
         self.mp_drawing = mp.solutions.drawing_utils
-        self.holistic = self.mp_holistic.Holistic(**MEDIAPIPE_CONFIG)
-        
+
+        # 더 안정적인 MediaPipe 설정 사용
+        mediapipe_config = MEDIAPIPE_CONFIG.copy()
+        # 세그멘테이션 관련 문제를 방지하기 위해 세그멘테이션 비활성화
+        mediapipe_config['enable_segmentation'] = False
+
+        try:
+            self.holistic = self.mp_holistic.Holistic(**mediapipe_config)
+        except Exception as e:
+            logging.error(f"MediaPipe 초기화 실패, 세그멘테이션 없이 재시도: {e}")
+            # 세그멘테이션 없이 재시도
+            mediapipe_config['enable_segmentation'] = False
+            self.holistic = self.mp_holistic.Holistic(**mediapipe_config)
+
+        # 프레임 크기 추적 변수들
+        self.expected_frame_size = None
+        self.frame_size_tolerance = FRAME_PROCESSING_CONFIG['frame_size_tolerance']
+        self.max_consecutive_errors = FRAME_PROCESSING_CONFIG['max_consecutive_errors']
+
         # 데이터 저장을 위한 리스트 초기화
         self.reset_data()
-    
+
+    def validate_frame(self, frame: np.ndarray) -> Tuple[bool, str]:
+        """프레임 유효성 검사 및 크기 일관성 확인"""
+        if frame is None or frame.size == 0:
+            return False, "프레임이 비어있거나 유효하지 않습니다"
+
+        height, width = frame.shape[:2]
+
+        # 첫 번째 프레임인 경우 기준 크기 설정
+        if self.expected_frame_size is None:
+            self.expected_frame_size = (height, width)
+            return True, "기준 프레임 크기 설정됨"
+
+        # 프레임 크기 일관성 확인
+        expected_height, expected_width = self.expected_frame_size
+        height_diff = abs(height - expected_height) / expected_height
+        width_diff = abs(width - expected_width) / expected_width
+
+        if height_diff > self.frame_size_tolerance or width_diff > self.frame_size_tolerance:
+            return False, f"프레임 크기 불일치: 예상 {self.expected_frame_size}, 실제 ({height}, {width})"
+
+        return True, "프레임 유효함"
+
+    def resize_frame(self, frame: np.ndarray) -> np.ndarray:
+        """프레임을 일관된 크기로 조정"""
+        if self.expected_frame_size is None:
+            return frame
+
+        expected_height, expected_width = self.expected_frame_size
+
+        # 보간 방법 설정
+        interpolation = cv2.INTER_LINEAR
+        if FRAME_PROCESSING_CONFIG['resize_interpolation'] == 'cubic':
+            interpolation = cv2.INTER_CUBIC
+        elif FRAME_PROCESSING_CONFIG['resize_interpolation'] == 'nearest':
+            interpolation = cv2.INTER_NEAREST
+
+        return cv2.resize(frame, (expected_width, expected_height), interpolation=interpolation)
+
+    def preprocess_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, bool]:
+        """프레임 전처리 (노이즈 제거, 밝기 조정 등)"""
+        try:
+            # 프레임이 비어있거나 유효하지 않은 경우
+            if frame is None or frame.size == 0:
+                return frame, False
+
+            # 프레임 크기 검증 및 조정
+            is_valid, validation_message = self.validate_frame(frame)
+            if not is_valid:
+                logging.warning(f"프레임 전처리 중: {validation_message}")
+                frame = self.resize_frame(frame)
+
+            # 밝기와 대비 조정 (선택적)
+            # 프레임이 너무 어둡거나 밝은 경우 조정
+            if frame.dtype == np.uint8:
+                lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+                l, a, b = cv2.split(lab)
+
+                # CLAHE (Contrast Limited Adaptive Histogram Equalization) 적용
+                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                l = clahe.apply(l)
+
+                # 밝기 조정 (너무 어두운 경우)
+                if np.mean(l) < 50:
+                    l = cv2.add(l, 30)
+                elif np.mean(l) > 200:
+                    l = cv2.subtract(l, 20)
+
+                lab = cv2.merge([l, a, b])
+                frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+            return frame, True
+
+        except Exception as e:
+            logging.error(f"프레임 전처리 중 오류: {e}")
+            return frame, False
+
     def reset_data(self):
         """데이터 저장 변수들 초기화"""
         self.frame_data = []
@@ -27,12 +120,33 @@ class SignLanguageSkeletonExtractor:
         self.face_landmarks_history = []
         self.left_hand_landmarks_history = []
         self.right_hand_landmarks_history = []
+        # 프레임 크기 추적 변수도 초기화
+        self.expected_frame_size = None
     
     def extract_landmarks(self, image: np.ndarray) -> Dict[str, Any]:
         """이미지에서 랜드마크 추출"""
-        # BGR을 RGB로 변환
-        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        results = self.holistic.process(rgb_image)
+        try:
+            # 프레임 전처리
+            processed_image, success = self.preprocess_frame(image)
+            if not success:
+                logging.warning("프레임 전처리 실패, 원본 프레임 사용")
+                processed_image = image
+
+            # BGR을 RGB로 변환
+            rgb_image = cv2.cvtColor(processed_image, cv2.COLOR_BGR2RGB)
+
+            # MediaPipe 처리
+            results = self.holistic.process(rgb_image)
+
+        except Exception as e:
+            logging.error(f"랜드마크 추출 중 오류 발생: {e}")
+            # 오류 발생 시 빈 결과 반환
+            return {
+                'pose': None,
+                'face': None,
+                'left_hand': None,
+                'right_hand': None
+            }
         
         landmarks_data = {
             'pose': None,
@@ -285,13 +399,39 @@ class SignLanguageSkeletonExtractor:
         prev_landmarks = None
         prev_velocities = None
         
+        consecutive_errors = 0
+
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
-            
-            # 랜드마크 추출
-            current_landmarks = self.extract_landmarks(frame)
+
+            # 프레임이 비어있는지 확인
+            if frame is None or frame.size == 0:
+                logging.warning(f"빈 프레임 발견 (프레임 {frame_idx}), 건너뜀")
+                frame_idx += 1
+                continue
+
+            try:
+                # 랜드마크 추출
+                current_landmarks = self.extract_landmarks(frame)
+                consecutive_errors = 0  # 성공 시 오류 카운트 리셋
+
+            except Exception as e:
+                consecutive_errors += 1
+                logging.error(f"프레임 {frame_idx} 처리 중 오류: {e}")
+
+                if consecutive_errors >= self.max_consecutive_errors:
+                    logging.error(f"연속 {self.max_consecutive_errors}프레임 오류로 인해 비디오 처리 중단")
+                    break
+
+                # 오류 발생 시 빈 랜드마크로 계속 진행
+                current_landmarks = {
+                    'pose': None,
+                    'face': None,
+                    'left_hand': None,
+                    'right_hand': None
+                }
             
             # 프레임 데이터 초기화
             frame_data = {
