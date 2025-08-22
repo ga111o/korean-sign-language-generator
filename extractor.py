@@ -8,18 +8,14 @@ from typing import List, Dict, Any, Tuple
 import math
 from datetime import datetime
 import logging
+from config import MEDIAPIPE_CONFIG
 
 class SignLanguageSkeletonExtractor:
     def __init__(self):
         # MediaPipe 초기화
         self.mp_holistic = mp.solutions.holistic
         self.mp_drawing = mp.solutions.drawing_utils
-        self.holistic = self.mp_holistic.Holistic(
-            static_image_mode=False,
-            model_complexity=2,
-            enable_segmentation=True,
-            refine_face_landmarks=True
-        )
+        self.holistic = self.mp_holistic.Holistic(**MEDIAPIPE_CONFIG)
         
         # 데이터 저장을 위한 리스트 초기화
         self.reset_data()

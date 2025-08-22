@@ -7,6 +7,10 @@ from utils import (
     get_processable_files, create_metadata, log_processing_info,
     log_statistics, log_completion_info
 )
+from config import (
+    CSV_PATH, DATASET_PATHS, DEFAULT_OUTPUT_DIR, DEFAULT_DIRECTION_FILTER,
+    OUTPUT_FILENAME_PATTERN
+)
 
 def main():
     # 로깅 설정
@@ -16,15 +20,22 @@ def main():
     extractor = SignLanguageSkeletonExtractor()
     
     # CSV 파일 읽기
-    csv_path = "./signlanguage_total.csv"
-    df = load_csv_data(csv_path)
-    
+    df = load_csv_data(CSV_PATH)
+
     # "정면" 데이터만 필터링
-    front_data = filter_front_data(df)
-    
-    # dataset 폴더 경로 설정
-    dataset_path = "./dataset"
-    output_dir = "output"
+    front_data = filter_front_data(df, DEFAULT_DIRECTION_FILTER)
+
+    # dataset 폴더 경로 설정 (여러 경로에서 첫 번째 존재하는 경로 사용)
+    dataset_path = None
+    for path in DATASET_PATHS:
+        if os.path.exists(path):
+            dataset_path = str(path)
+            break
+
+    if dataset_path is None:
+        raise FileNotFoundError(f"Dataset directory not found in any of: {DATASET_PATHS}")
+
+    output_dir = DEFAULT_OUTPUT_DIR
     
     # dataset 폴더에서 모든 비디오 파일 찾기
     video_files = find_video_files(dataset_path)
@@ -44,7 +55,7 @@ def main():
         log_processing_info(file_info, i, len(processable_files))
         
         # 출력 파일명 생성
-        output_path = os.path.join(output_dir, f"{base_name}_skeleton_data.json")
+        output_path = os.path.join(output_dir, OUTPUT_FILENAME_PATTERN.format(base_name=base_name))
         
         try:
             # 비디오 처리 및 데이터 추출

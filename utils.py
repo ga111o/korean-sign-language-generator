@@ -3,16 +3,19 @@ import pandas as pd
 import logging
 from datetime import datetime
 from typing import List, Dict, Any
+from config import (
+    LOG_DIR, LOG_FILENAME_PREFIX, SUPPORTED_VIDEO_EXTENSIONS,
+    OUTPUT_FILENAME_PATTERN, DEFAULT_DIRECTION_FILTER
+)
 
 def setup_logging():
     """로깅 설정"""
     # 로그 디렉토리 생성
-    log_dir = os.path.join('.', 'logs', 'extractor')
-    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
     # 로그 파일명 생성 (현재 시간 기준)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filename = os.path.join(log_dir, f"sign_language_processing_{timestamp}.log")
-    
+    log_filename = str(LOG_DIR / f"{LOG_FILENAME_PREFIX}_{timestamp}.log")
+
     # 로깅 설정
     logging.basicConfig(
         level=logging.INFO,
@@ -37,30 +40,27 @@ def load_csv_data(csv_path: str) -> pd.DataFrame:
         logging.error(f"CSV 파일 읽기 실패: {e}")
         raise
 
-def filter_front_data(df: pd.DataFrame) -> pd.DataFrame:
-    """정면 데이터만 필터링"""
-    front_data = df[df['방향'] == '정면'].copy()
-    logging.info(f"정면 데이터: {len(front_data)}개")
-    
-    if len(front_data) == 0:
-        raise ValueError("정면 데이터가 없습니다.")
-    
-    return front_data
+def filter_front_data(df: pd.DataFrame, direction_filter: str = DEFAULT_DIRECTION_FILTER) -> pd.DataFrame:
+    """지정된 방향 데이터만 필터링"""
+    filtered_data = df[df['방향'] == direction_filter].copy()
+    logging.info(f"{direction_filter} 데이터: {len(filtered_data)}개")
+
+    if len(filtered_data) == 0:
+        raise ValueError(f"{direction_filter} 데이터가 없습니다.")
+
+    return filtered_data
 
 def find_video_files(dataset_path: str) -> Dict[str, str]:
     """dataset 폴더에서 비디오 파일 찾기"""
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"오류: {dataset_path} 폴더가 존재하지 않습니다.")
     
-    # 지원하는 비디오 파일 확장자
-    video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.mts', '.MOV', '.MTS']
-    
     video_files = {}
     for filename in os.listdir(dataset_path):
         file_path = os.path.join(dataset_path, filename)
         if os.path.isfile(file_path):
             file_ext = os.path.splitext(filename)[1].lower()
-            if file_ext in [ext.lower() for ext in video_extensions]:
+            if file_ext in [ext.lower() for ext in SUPPORTED_VIDEO_EXTENSIONS]:
                 # 확장자를 제외한 파일명
                 base_name = os.path.splitext(filename)[0]
                 video_files[base_name] = file_path
@@ -78,7 +78,7 @@ def get_processable_files(front_data: pd.DataFrame, video_files: Dict[str, str],
         
         if base_name in video_files:
             # 이미 JSON 파일이 존재하는지 확인
-            output_path = os.path.join(output_dir, f"{base_name}_skeleton_data.json")
+            output_path = os.path.join(output_dir, OUTPUT_FILENAME_PATTERN.format(base_name=base_name))
             if os.path.exists(output_path):
                 logging.info(f"이미 처리된 파일 건너뛰기: {filename}")
                 continue
@@ -131,9 +131,9 @@ def log_statistics(stats: Dict[str, Any]):
 def log_completion_info(processable_files: List[Dict[str, Any]], output_dir: str, log_filename: str):
     """완료 정보 로깅"""
     logging.info(f"\n====================== done! ======================")
-    success_count = len([f for f in processable_files if os.path.exists(os.path.join(output_dir, f"{f['base_name']}_skeleton_data.json"))])
+    success_count = len([f for f in processable_files if os.path.exists(os.path.join(output_dir, OUTPUT_FILENAME_PATTERN.format(base_name=f['base_name'])))])
     logging.info(f"성공적으로 처리된 파일: {success_count}개")
     logging.info(f"출력 디렉토리: {output_dir}")
     logging.info(f"로그 파일: {log_filename}")
-    
+
     print(f"\n처리 완료! 로그 파일이 생성되었습니다: {log_filename}") 
