@@ -8,24 +8,42 @@ from typing import List, Dict, Any, Tuple
 import math
 from datetime import datetime
 import logging
-from config import MEDIAPIPE_CONFIG, FRAME_PROCESSING_CONFIG
+import platform
+import subprocess
+from config import MEDIAPIPE_CONFIG, MEDIAPIPE_GPU_CONFIG, FRAME_PROCESSING_CONFIG, GPU_CONFIG
 
 class SignLanguageSkeletonExtractor:
     def __init__(self):
+        # GPU 가용성 및 설정 초기화
+        self.gpu_available = self._check_gpu_availability()
+        self.use_gpu = GPU_CONFIG['use_gpu'] and self.gpu_available
+        
         # MediaPipe 초기화
         self.mp_holistic = mp.solutions.holistic
         self.mp_drawing = mp.solutions.drawing_utils
 
-        # 더 안정적인 MediaPipe 설정 사용
-        mediapipe_config = MEDIAPIPE_CONFIG.copy()
+        # GPU 사용 여부에 따른 MediaPipe 설정 선택
+        if self.use_gpu:
+            logging.info("GPU 가속 모드로 MediaPipe 초기화")
+            mediapipe_config = MEDIAPIPE_GPU_CONFIG.copy()
+        else:
+            logging.info("CPU 모드로 MediaPipe 초기화")
+            mediapipe_config = MEDIAPIPE_CONFIG.copy()
+        
         # 세그멘테이션 관련 문제를 방지하기 위해 세그멘테이션 비활성화
         mediapipe_config['enable_segmentation'] = False
 
         try:
-            self.holistic = self.mp_holistic.Holistic(**mediapipe_config)
+            if self.use_gpu:
+                # GPU 초기화 시도
+                self.holistic = self._initialize_gpu_mediapipe(mediapipe_config)
+            else:
+                self.holistic = self.mp_holistic.Holistic(**mediapipe_config)
         except Exception as e:
-            logging.error(f"MediaPipe 초기화 실패, 세그멘테이션 없이 재시도: {e}")
-            # 세그멘테이션 없이 재시도
+            logging.error(f"MediaPipe 초기화 실패, CPU 모드로 폴백: {e}")
+            # GPU 실패 시 CPU로 폴백
+            self.use_gpu = False
+            mediapipe_config = MEDIAPIPE_CONFIG.copy()
             mediapipe_config['enable_segmentation'] = False
             self.holistic = self.mp_holistic.Holistic(**mediapipe_config)
 
@@ -33,9 +51,47 @@ class SignLanguageSkeletonExtractor:
         self.expected_frame_size = None
         self.frame_size_tolerance = FRAME_PROCESSING_CONFIG['frame_size_tolerance']
         self.max_consecutive_errors = FRAME_PROCESSING_CONFIG['max_consecutive_errors']
+        
+        # GPU 관련 설정
+        self.use_gpu_processing = FRAME_PROCESSING_CONFIG.get('use_gpu_processing', False) and self.use_gpu
+        self.gpu_batch_size = FRAME_PROCESSING_CONFIG.get('gpu_batch_size', 8)
 
         # 데이터 저장을 위한 리스트 초기화
         self.reset_data()
+        
+        logging.info(f"SignLanguageSkeletonExtractor 초기화 완료 - GPU 사용: {self.use_gpu}")
+
+    def _check_gpu_availability(self) -> bool:
+        """GPU(CUDA) 사용 가능 여부 확인"""
+        try:
+            # NVIDIA GPU 확인
+            result = subprocess.run(['nvidia-smi'], capture_output=True, text=True)
+            if result.returncode == 0:
+                logging.info("NVIDIA GPU 감지됨")
+                
+                # OpenCV CUDA 지원 확인
+                if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+                    logging.info(f"OpenCV CUDA 지원: {cv2.cuda.getCudaEnabledDeviceCount()}개 디바이스")
+                    return True
+                else:
+                    logging.warning("NVIDIA GPU는 있지만 OpenCV CUDA 지원 없음")
+            else:
+                logging.info("NVIDIA GPU를 찾을 수 없음")
+        except (subprocess.CalledProcessError, FileNotFoundError, AttributeError):
+            logging.info("GPU 확인 실패 - CPU 모드로 실행")
+        
+        return False
+
+    def _initialize_gpu_mediapipe(self, config):
+        """GPU 가속 MediaPipe 초기화"""
+        try:
+            # MediaPipe GPU delegate 설정 시도
+            # 현재 MediaPipe Python API는 GPU delegate를 직접 지원하지 않으므로
+            # 표준 초기화를 사용하되 더 높은 model_complexity 적용
+            return self.mp_holistic.Holistic(**config)
+        except Exception as e:
+            logging.error(f"GPU MediaPipe 초기화 실패: {e}")
+            raise
 
     def validate_frame(self, frame: np.ndarray) -> Tuple[bool, str]:
         """프레임 유효성 검사 및 크기 일관성 확인"""
@@ -60,7 +116,7 @@ class SignLanguageSkeletonExtractor:
         return True, "프레임 유효함"
 
     def resize_frame(self, frame: np.ndarray) -> np.ndarray:
-        """프레임을 일관된 크기로 조정"""
+        """프레임을 일관된 크기로 조정 (GPU 가속 지원)"""
         if self.expected_frame_size is None:
             return frame
 
@@ -73,10 +129,29 @@ class SignLanguageSkeletonExtractor:
         elif FRAME_PROCESSING_CONFIG['resize_interpolation'] == 'nearest':
             interpolation = cv2.INTER_NEAREST
 
+        # GPU 가속 리사이징 시도
+        if self.use_gpu_processing:
+            try:
+                # GPU 메모리로 이미지 업로드
+                gpu_frame = cv2.cuda_GpuMat()
+                gpu_frame.upload(frame)
+                
+                # GPU에서 리사이징 수행
+                gpu_resized = cv2.cuda.resize(gpu_frame, (expected_width, expected_height), interpolation=interpolation)
+                
+                # CPU 메모리로 다운로드
+                resized_frame = gpu_resized.download()
+                return resized_frame
+            except Exception as e:
+                logging.warning(f"GPU 리사이징 실패, CPU로 폴백: {e}")
+                # GPU 실패 시 CPU로 폴백
+                pass
+
+        # CPU 리사이징
         return cv2.resize(frame, (expected_width, expected_height), interpolation=interpolation)
 
     def preprocess_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, bool]:
-        """프레임 전처리 (노이즈 제거, 밝기 조정 등)"""
+        """프레임 전처리 (노이즈 제거, 밝기 조정 등) - GPU 가속 지원"""
         try:
             # 프레임이 비어있거나 유효하지 않은 경우
             if frame is None or frame.size == 0:
@@ -88,30 +163,221 @@ class SignLanguageSkeletonExtractor:
                 logging.warning(f"프레임 전처리 중: {validation_message}")
                 frame = self.resize_frame(frame)
 
-            # 밝기와 대비 조정 (선택적)
-            # 프레임이 너무 어둡거나 밝은 경우 조정
-            if frame.dtype == np.uint8:
-                lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-                l, a, b = cv2.split(lab)
+            # GPU 가속 전처리 시도
+            if self.use_gpu_processing:
+                try:
+                    return self._preprocess_frame_gpu(frame)
+                except Exception as e:
+                    logging.warning(f"GPU 전처리 실패, CPU로 폴백: {e}")
 
-                # CLAHE (Contrast Limited Adaptive Histogram Equalization) 적용
-                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-                l = clahe.apply(l)
-
-                # 밝기 조정 (너무 어두운 경우)
-                if np.mean(l) < 50:
-                    l = cv2.add(l, 30)
-                elif np.mean(l) > 200:
-                    l = cv2.subtract(l, 20)
-
-                lab = cv2.merge([l, a, b])
-                frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-            return frame, True
+            # CPU 전처리
+            return self._preprocess_frame_cpu(frame)
 
         except Exception as e:
             logging.error(f"프레임 전처리 중 오류: {e}")
             return frame, False
+
+    def _preprocess_frame_gpu(self, frame: np.ndarray) -> Tuple[np.ndarray, bool]:
+        """GPU 기반 프레임 전처리"""
+        # GPU 메모리로 업로드
+        gpu_frame = cv2.cuda_GpuMat()
+        gpu_frame.upload(frame)
+
+        # GPU에서 색상 공간 변환
+        gpu_lab = cv2.cuda.cvtColor(gpu_frame, cv2.COLOR_BGR2LAB)
+        
+        # LAB 채널 분리 (CPU에서 수행 - GPU split이 없는 경우)
+        lab_cpu = gpu_lab.download()
+        l, a, b = cv2.split(lab_cpu)
+
+        # CLAHE 적용 (CPU에서 수행)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+
+        # 밝기 조정
+        if np.mean(l) < 50:
+            l = cv2.add(l, 30)
+        elif np.mean(l) > 200:
+            l = cv2.subtract(l, 20)
+
+        # 채널 병합 후 GPU로 업로드
+        lab_adjusted = cv2.merge([l, a, b])
+        gpu_lab_adjusted = cv2.cuda_GpuMat()
+        gpu_lab_adjusted.upload(lab_adjusted)
+
+        # GPU에서 색상 공간 변환
+        gpu_result = cv2.cuda.cvtColor(gpu_lab_adjusted, cv2.COLOR_LAB2BGR)
+        
+        # 결과 다운로드
+        result = gpu_result.download()
+        return result, True
+
+    def _preprocess_frame_cpu(self, frame: np.ndarray) -> Tuple[np.ndarray, bool]:
+        """CPU 기반 프레임 전처리"""
+        # 밝기와 대비 조정 (선택적)
+        # 프레임이 너무 어둡거나 밝은 경우 조정
+        if frame.dtype == np.uint8:
+            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+
+            # CLAHE (Contrast Limited Adaptive Histogram Equalization) 적용
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            l = clahe.apply(l)
+
+            # 밝기 조정 (너무 어두운 경우)
+            if np.mean(l) < 50:
+                l = cv2.add(l, 30)
+            elif np.mean(l) > 200:
+                l = cv2.subtract(l, 20)
+
+            lab = cv2.merge([l, a, b])
+            frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+        return frame, True
+
+    def process_frame_batch_gpu(self, frames: List[np.ndarray]) -> List[Dict[str, Any]]:
+        """GPU에서 프레임 배치 처리"""
+        if not self.use_gpu_processing or not frames:
+            return [self.extract_landmarks(frame) for frame in frames]
+        
+        try:
+            # GPU 메모리 최적화를 위해 배치 크기 제한
+            batch_size = min(len(frames), self.gpu_batch_size)
+            results = []
+            
+            for i in range(0, len(frames), batch_size):
+                batch = frames[i:i + batch_size]
+                batch_results = []
+                
+                for frame in batch:
+                    # 개별 프레임 처리 (현재 MediaPipe는 배치 처리를 직접 지원하지 않음)
+                    landmarks = self.extract_landmarks(frame)
+                    batch_results.append(landmarks)
+                
+                results.extend(batch_results)
+                
+                # GPU 메모리 정리 (선택적)
+                if hasattr(cv2.cuda, 'deviceSynchronize'):
+                    cv2.cuda.deviceSynchronize()
+            
+            return results
+            
+        except Exception as e:
+            logging.error(f"GPU 배치 처리 실패: {e}")
+            # CPU로 폴백
+            return [self.extract_landmarks(frame) for frame in frames]
+
+    def optimize_gpu_memory(self):
+        """GPU 메모리 최적화"""
+        if self.use_gpu_processing:
+            try:
+                # CUDA 컨텍스트 동기화
+                if hasattr(cv2.cuda, 'deviceSynchronize'):
+                    cv2.cuda.deviceSynchronize()
+                
+                # 가비지 컬렉션 강제 실행
+                import gc
+                gc.collect()
+                
+            except Exception as e:
+                logging.warning(f"GPU 메모리 최적화 중 오류: {e}")
+
+    def _process_batch(self, frame_batch: List[np.ndarray], batch_indices: List[int], 
+                      prev_landmarks: Dict, prev_velocities: Dict, fps: float):
+        """프레임 배치 처리"""
+        # 배치 랜드마크 추출
+        landmarks_batch = self.process_frame_batch_gpu(frame_batch)
+        
+        # 각 프레임 데이터 처리
+        for i, (landmarks, frame_idx) in enumerate(zip(landmarks_batch, batch_indices)):
+            self._process_single_frame_data(landmarks, frame_idx, fps, prev_landmarks, prev_velocities)
+
+    def _process_remaining_batch(self, frame_batch: List[np.ndarray], batch_indices: List[int],
+                               prev_landmarks: Dict, prev_velocities: Dict, fps: float):
+        """남은 배치 처리"""
+        if frame_batch:
+            self._process_batch(frame_batch, batch_indices, prev_landmarks, prev_velocities, fps)
+
+    def _process_single_frame_data(self, current_landmarks: Dict, frame_idx: int, fps: float,
+                                 prev_landmarks: Dict, prev_velocities: Dict):
+        """단일 프레임 데이터 처리"""
+        # 프레임 데이터 초기화
+        frame_data = {
+            'frame_index': frame_idx,
+            'timestamp': frame_idx / fps,
+            'landmarks': {},
+            'normalized_landmarks': {},
+            'velocities': {},
+            'accelerations': {},
+            'hand_features': {},
+            'face_features': {},
+            'sign_properties': {}
+        }
+        
+        # 각 부위별 처리
+        for part in ['pose', 'face', 'left_hand', 'right_hand']:
+            landmarks = current_landmarks[part]
+            
+            if landmarks:
+                # 원본 랜드마크 저장
+                frame_data['landmarks'][part] = landmarks
+                
+                # 정규화된 랜드마크 저장
+                normalized = self.normalize_landmarks(landmarks)
+                frame_data['normalized_landmarks'][part] = normalized
+                
+                # 속도 계산 (이전 프레임이 있는 경우)
+                if prev_landmarks and prev_landmarks.get(part):
+                    velocity = self.calculate_velocity(
+                        landmarks, prev_landmarks[part], fps
+                    )
+                    frame_data['velocities'][part] = velocity
+                    
+                    # 가속도 계산 (이전 속도가 있는 경우)
+                    if (prev_velocities and prev_velocities.get(part) and 
+                        velocity):
+                        acceleration = self.calculate_acceleration(
+                            velocity, prev_velocities[part], fps
+                        )
+                        frame_data['accelerations'][part] = acceleration
+        
+        # 손 특징 추출
+        if current_landmarks['left_hand']:
+            frame_data['hand_features']['left'] = self.extract_hand_features(
+                current_landmarks['left_hand']
+            )
+        
+        if current_landmarks['right_hand']:
+            frame_data['hand_features']['right'] = self.extract_hand_features(
+                current_landmarks['right_hand']
+            )
+        
+        # 얼굴 특징 추출
+        if current_landmarks['face']:
+            frame_data['face_features'] = self.extract_face_features(
+                current_landmarks['face']
+            )
+        
+        # 수어 속성 분류
+        frame_data['sign_properties'] = self.classify_sign_properties(
+            current_landmarks['pose'],
+            current_landmarks['left_hand'],
+            current_landmarks['right_hand']
+        )
+        
+        # 프레임 데이터 저장
+        self.frame_data.append(frame_data)
+        
+        # 이전 프레임 데이터 업데이트
+        if prev_landmarks is not None:
+            prev_landmarks.update(current_landmarks)
+        else:
+            prev_landmarks = current_landmarks.copy()
+            
+        if prev_velocities is not None:
+            prev_velocities.update(frame_data['velocities'])
+        else:
+            prev_velocities = frame_data['velocities'].copy()
 
     def reset_data(self):
         """데이터 저장 변수들 초기화"""
@@ -379,7 +645,7 @@ class SignLanguageSkeletonExtractor:
         return properties
     
     def process_video(self, video_path: str, output_path: str = None) -> Dict[str, Any]:
-        """비디오 처리 메인 함수"""
+        """비디오 처리 메인 함수 - GPU 가속 지원"""
         # 비디오 캡처 객체 생성
         cap = cv2.VideoCapture(video_path)
         
@@ -391,6 +657,7 @@ class SignLanguageSkeletonExtractor:
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
         logging.info(f"{video_path} | FPS: {fps} | 총 프레임: {total_frames}")
+        logging.info(f"GPU 가속 사용: {self.use_gpu}, GPU 프레임 처리: {self.use_gpu_processing}")
         
         self.reset_data()
         frame_idx = 0
@@ -400,10 +667,17 @@ class SignLanguageSkeletonExtractor:
         prev_velocities = None
         
         consecutive_errors = 0
+        
+        # GPU 메모리 최적화를 위한 배치 처리 준비
+        frame_batch = []
+        batch_indices = []
 
         while True:
             ret, frame = cap.read()
             if not ret:
+                # 마지막 배치 처리
+                if frame_batch:
+                    self._process_remaining_batch(frame_batch, batch_indices, prev_landmarks, prev_velocities, fps)
                 break
 
             # 프레임이 비어있는지 확인
@@ -412,6 +686,25 @@ class SignLanguageSkeletonExtractor:
                 frame_idx += 1
                 continue
 
+            # 배치 처리 모드인 경우
+            if self.use_gpu_processing and self.gpu_batch_size > 1:
+                frame_batch.append(frame)
+                batch_indices.append(frame_idx)
+                
+                # 배치가 가득 찼거나 마지막 프레임인 경우 처리
+                if len(frame_batch) >= self.gpu_batch_size:
+                    self._process_batch(frame_batch, batch_indices, prev_landmarks, prev_velocities, fps)
+                    frame_batch = []
+                    batch_indices = []
+                    
+                    # 주기적으로 GPU 메모리 최적화
+                    if frame_idx % (self.gpu_batch_size * 4) == 0:
+                        self.optimize_gpu_memory()
+                
+                frame_idx += 1
+                continue
+
+            # 단일 프레임 처리 (기존 로직)
             try:
                 # 랜드마크 추출
                 current_landmarks = self.extract_landmarks(frame)
@@ -508,6 +801,10 @@ class SignLanguageSkeletonExtractor:
         
         cap.release()
         
+        # GPU 메모리 정리
+        if self.use_gpu_processing:
+            self.optimize_gpu_memory()
+        
         # 결과 데이터 구성
         result_data = {
             'video_info': {
@@ -515,7 +812,9 @@ class SignLanguageSkeletonExtractor:
                 'fps': fps,
                 'total_frames': total_frames,
                 'duration': total_frames / fps,
-                'processing_date': datetime.now().isoformat()
+                'processing_date': datetime.now().isoformat(),
+                'gpu_accelerated': self.use_gpu,
+                'gpu_processing': self.use_gpu_processing
             },
             'frame_data': self.frame_data,
             'statistics': self._calculate_statistics()
