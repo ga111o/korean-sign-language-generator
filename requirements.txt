@@ -5,3 +5,5 @@ pandas
 torch
 transformers
 einops
+psycopg2-binary
+python-dotenv

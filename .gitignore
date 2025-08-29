@@ -3,3 +3,4 @@ dataset/
 output/
 *.log
 __pycache__/
+.env
