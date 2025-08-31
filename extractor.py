@@ -438,6 +438,170 @@ class SignLanguageSkeletonExtractor:
             if 'conn' in locals():
                 conn.rollback()
                 conn.close()
+
+    def save_video_and_frames_atomically(self, video_path: str, fps: float, total_frames: int, 
+                                       duration: float, video_id: int = None) -> int:
+        """비디오와 프레임 데이터를 원자적으로 저장 - 프레임이 모두 저장되어야만 비디오 메타데이터 저장"""
+        if not self.use_database or not self.frame_data:
+            return None
+            
+        conn = None
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            # 트랜잭션 시작
+            conn.autocommit = False
+            
+            # 파일명에서 비디오 ID 추출
+            filename = os.path.basename(video_path)
+            if video_id is None:
+                video_id_match = filename.split('_')
+                if len(video_id_match) >= 3:
+                    video_id = int(video_id_match[2].split('.')[0])
+                else:
+                    video_id = hash(filename) % 1000000
+            
+            # 1. 먼저 모든 프레임 데이터 준비 및 검증
+            def serialize_landmarks(landmarks):
+                return pickle.dumps(landmarks) if landmarks else None
+            
+            batch_data = []
+            for frame_data in self.frame_data:
+                # 얼굴 특징 추출
+                face_features = frame_data.get('face_features', {})
+                eyebrow_height_left = face_features.get('eyebrow_height', [0.0, 0.0])[0] if face_features else None
+                eyebrow_height_right = face_features.get('eyebrow_height', [0.0, 0.0])[1] if face_features else None
+                eye_openness_left = face_features.get('eye_openness', [0.0, 0.0])[0] if face_features else None
+                eye_openness_right = face_features.get('eye_openness', [0.0, 0.0])[1] if face_features else None
+                mouth_openness = face_features.get('mouth_openness', 0.0) if face_features else None
+                mouth_width = face_features.get('mouth_width', 0.0) if face_features else None
+                
+                # 수어 속성
+                sign_props = frame_data.get('sign_properties', {})
+                hand_usage = sign_props.get('hand_usage', 'unknown')
+                movement_type = sign_props.get('movement_type', 'unknown')
+                repetition = sign_props.get('repetition', False)
+                sign_type = sign_props.get('sign_type', 'unknown')
+                
+                batch_data.append((
+                    video_id,  # 임시 video_id 사용
+                    frame_data['frame_index'],
+                    frame_data['timestamp'],
+                    serialize_landmarks(frame_data['landmarks'].get('pose')),
+                    serialize_landmarks(frame_data['landmarks'].get('face')),
+                    serialize_landmarks(frame_data['landmarks'].get('left_hand')),
+                    serialize_landmarks(frame_data['landmarks'].get('right_hand')),
+                    serialize_landmarks(frame_data['normalized_landmarks'].get('pose')),
+                    serialize_landmarks(frame_data['normalized_landmarks'].get('face')),
+                    serialize_landmarks(frame_data['normalized_landmarks'].get('left_hand')),
+                    serialize_landmarks(frame_data['normalized_landmarks'].get('right_hand')),
+                    serialize_landmarks(frame_data['velocities']),
+                    eyebrow_height_left, eyebrow_height_right,
+                    eye_openness_left, eye_openness_right, 
+                    mouth_openness, mouth_width,
+                    hand_usage, movement_type, repetition, sign_type
+                ))
+            
+            # 2. 비디오 메타데이터 저장/업데이트
+            cursor.execute("SELECT id FROM sign_language_videos WHERE video_id = %s", (video_id,))
+            existing = cursor.fetchone()
+            
+            # 평균 속도 계산
+            avg_left_velocity = float(np.mean(self.statistics['total_left_velocity'])) if self.statistics['total_left_velocity'] else 0.0
+            avg_right_velocity = float(np.mean(self.statistics['total_right_velocity'])) if self.statistics['total_right_velocity'] else 0.0
+            
+            if existing:
+                # 기존 레코드 업데이트
+                update_query = """
+                    UPDATE sign_language_videos 
+                    SET video_path = %s, fps = %s, total_frames = %s, duration = %s,
+                        processing_date = %s, gpu_accelerated = %s, gpu_processing = %s,
+                        filename = %s, stats_total_frames = %s,
+                        frames_with_pose = %s, frames_with_face = %s,
+                        frames_with_left_hand = %s, frames_with_right_hand = %s,
+                        avg_left_hand_velocity = %s, avg_right_hand_velocity = %s,
+                        hand_usage_one_hand = %s, hand_usage_two_hands = %s,
+                        hand_usage_no_hands = %s
+                    WHERE video_id = %s
+                """
+                cursor.execute(update_query, (
+                    video_path, fps, total_frames, duration,
+                    datetime.now(), False, False, filename,
+                    self.statistics['total_frames'],
+                    self.statistics['frames_with_pose'],
+                    self.statistics['frames_with_face'],
+                    self.statistics['frames_with_left_hand'],
+                    self.statistics['frames_with_right_hand'],
+                    avg_left_velocity, avg_right_velocity,
+                    self.statistics['hand_usage_distribution']['one_hand'],
+                    self.statistics['hand_usage_distribution']['two_hands'],
+                    self.statistics['hand_usage_distribution']['no_hands'],
+                    video_id
+                ))
+            else:
+                # 새 레코드 삽입
+                insert_query = """
+                    INSERT INTO sign_language_videos 
+                    (video_id, video_path, fps, total_frames, duration, 
+                     processing_date, gpu_accelerated, gpu_processing, filename,
+                     stats_total_frames, frames_with_pose, frames_with_face,
+                     frames_with_left_hand, frames_with_right_hand,
+                     avg_left_hand_velocity, avg_right_hand_velocity,
+                     hand_usage_one_hand, hand_usage_two_hands, hand_usage_no_hands)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """
+                cursor.execute(insert_query, (
+                    video_id, video_path, fps, total_frames, duration,
+                    datetime.now(), False, False, filename,
+                    self.statistics['total_frames'],
+                    self.statistics['frames_with_pose'],
+                    self.statistics['frames_with_face'],
+                    self.statistics['frames_with_left_hand'],
+                    self.statistics['frames_with_right_hand'],
+                    avg_left_velocity, avg_right_velocity,
+                    self.statistics['hand_usage_distribution']['one_hand'],
+                    self.statistics['hand_usage_distribution']['two_hands'],
+                    self.statistics['hand_usage_distribution']['no_hands']
+                ))
+            
+            # 3. 기존 프레임 데이터 삭제 (업데이트의 경우)
+            cursor.execute("DELETE FROM video_frames WHERE video_id = %s", (video_id,))
+            
+            # 4. 모든 프레임 데이터 삽입 - 이것이 실패하면 전체 트랜잭션 롤백
+            insert_query = """
+                INSERT INTO video_frames 
+                (video_id, frame_index, timestamp,
+                 pose_landmarks, face_landmarks, left_hand_landmarks, right_hand_landmarks,
+                 normalized_pose_landmarks, normalized_face_landmarks, 
+                 normalized_left_hand_landmarks, normalized_right_hand_landmarks,
+                 velocities, eyebrow_height_left, eyebrow_height_right,
+                 eye_openness_left, eye_openness_right, mouth_openness, mouth_width,
+                 hand_usage, movement_type, repetition, sign_type)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            
+            cursor.executemany(insert_query, batch_data)
+            
+            # 5. 모든 작업이 성공하면 커밋
+            conn.commit()
+            
+            logging.info(f"비디오와 프레임 데이터 원자적 저장 완료: video_id={video_id}, frames={len(batch_data)}")
+            
+            self.current_video_id = video_id
+            return video_id
+            
+        except Exception as e:
+            # 오류 발생 시 롤백
+            if conn:
+                conn.rollback()
+            logging.error(f"비디오와 프레임 데이터 원자적 저장 실패: {e}")
+            raise
+            
+        finally:
+            if conn:
+                cursor.close()
+                conn.close()
     
     def extract_landmarks(self, image: np.ndarray) -> Dict[str, Any]:
         """이미지에서 랜드마크 추출"""
@@ -712,16 +876,6 @@ class SignLanguageSkeletonExtractor:
         
         self.reset_data()
         
-        # 데이터베이스에 비디오 메타데이터 저장
-        if self.use_database:
-            try:
-                self.save_video_metadata_to_db(video_path, fps, total_frames, duration, video_id)
-                logging.info(f"비디오 메타데이터 DB 저장 완료: {video_path}")
-            except Exception as e:
-                logging.error(f"비디오 메타데이터 DB 저장 실패: {e}")
-                if not output_path:  # JSON 백업도 없으면 중단
-                    raise
-        
         frame_idx = 0
         
         # 이전 프레임 데이터 저장용 변수
@@ -845,13 +999,12 @@ class SignLanguageSkeletonExtractor:
         
         cap.release()
         
-        # 비디오 처리 완료 후 모든 프레임 데이터를 DB에 일괄 저장
+        # 비디오 처리 완료 후 모든 데이터를 원자적으로 DB에 저장
         if self.use_database:
             try:
-                logging.info(f"비디오 처리 완료. DB에 {len(self.frame_data)}개 프레임 저장 중...")
-                self.save_all_frames_to_db()
-                self.update_statistics_in_db()
-                logging.info("비디오 데이터 DB 저장 완료")
+                logging.info(f"비디오 처리 완료. DB에 비디오와 {len(self.frame_data)}개 프레임 원자적 저장 중...")
+                self.save_video_and_frames_atomically(video_path, fps, total_frames, duration, video_id)
+                logging.info("비디오와 프레임 데이터 원자적 저장 완료")
                 
                 # DB 저장 완료 후 메모리 절약을 위해 프레임 데이터 클리어 (선택사항)
                 if not output_path:  # JSON 백업이 필요없는 경우에만
@@ -860,7 +1013,9 @@ class SignLanguageSkeletonExtractor:
                     frame_data_for_result = self.frame_data
                     
             except Exception as e:
-                logging.error(f"비디오 데이터 DB 저장 실패: {e}")
+                logging.error(f"비디오와 프레임 데이터 원자적 저장 실패: {e}")
+                if not output_path:  # JSON 백업도 없으면 중단
+                    raise
                 frame_data_for_result = self.frame_data  # 실패 시 JSON으로라도 저장
         else:
             frame_data_for_result = self.frame_data
