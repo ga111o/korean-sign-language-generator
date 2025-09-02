@@ -59,7 +59,7 @@ def main():
         
         try:
             # 비디오 처리 및 데이터 추출
-            result_data = extractor.process_video(video_path, output_path)
+            result_data = extractor.process_video(video_path, output_path = None)
             
             # 메타데이터를 최상단에 영어로 추가
             metadata = create_metadata(row_data)
